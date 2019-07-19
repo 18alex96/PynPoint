@@ -13,6 +13,7 @@ from typeguard import typechecked
 from pynpoint.core.processing import ProcessingModule
 from pynpoint.util.image import create_mask
 from pynpoint.util.module import progress
+from pynpoint.util.timestamps import create_timestamp_list, calc_sky_frame
 
 
 class SimpleBackgroundSubtractionModule(ProcessingModule):
@@ -443,96 +444,10 @@ class NoddingBackgroundModule(ProcessingModule):
         self.m_sky_in_port = self.add_input_port(sky_in_tag)
         self.m_image_out_port = self.add_output_port(image_out_tag)
 
-        self.m_time_stamps = []
-
         if mode in ['next', 'previous', 'both']:
             self.m_mode = mode
         else:
             raise ValueError('Mode needs to be \'next\', \'previous\', or \'both\'.')
-
-    def _create_time_stamp_list(self):
-        """
-        Internal method for assigning a time stamp, based on the exposure number ID, to each cube
-        of sky and science images.
-        """
-
-        class TimeStamp:
-            """
-            Class for creating a time stamp.
-            """
-
-            def __init__(self, time_in, im_type, index):
-
-                self.m_time = time_in
-                self.m_im_type = im_type
-                self.m_index = index
-
-            def __repr__(self):
-
-                return repr((self.m_time,
-                             self.m_im_type,
-                             self.m_index))
-
-        exp_no_sky = self.m_sky_in_port.get_attribute('EXP_NO')
-        exp_no_science = self.m_science_in_port.get_attribute('EXP_NO')
-
-        nframes_sky = self.m_sky_in_port.get_attribute('NFRAMES')
-        nframes_science = self.m_science_in_port.get_attribute('NFRAMES')
-
-        if np.all(nframes_sky != 1):
-            warnings.warn('The NFRAMES values of the sky images are not all equal to unity. '
-                          'The StackCubesModule should be applied on the sky images before the '
-                          'NoddingBackgroundModule is used.')
-
-        for i, item in enumerate(exp_no_sky):
-            self.m_time_stamps.append(TimeStamp(item, 'SKY', i))
-
-        current = 0
-        for i, item in enumerate(exp_no_science):
-            frames = slice(current, current+nframes_science[i])
-            self.m_time_stamps.append(TimeStamp(item, 'SCIENCE', frames))
-            current += nframes_science[i]
-
-        self.m_time_stamps = sorted(self.m_time_stamps, key=lambda time_stamp: time_stamp.m_time)
-
-    def calc_sky_frame(self,
-                       index_of_science_data):
-        """
-        Method for finding the required sky frame (next, previous, or the mean of next and
-        previous) by comparing the time stamp of the science frame with preceding and following
-        sky frames.
-        """
-
-        if not any(x.m_im_type == 'SKY' for x in self.m_time_stamps):
-            raise ValueError('List of time stamps does not contain any SKY images.')
-
-        def search_for_next_sky():
-            for i in range(index_of_science_data, len(self.m_time_stamps)):
-                if self.m_time_stamps[i].m_im_type == 'SKY':
-                    return self.m_sky_in_port[self.m_time_stamps[i].m_index, ]
-
-            # no next sky found, look for previous sky
-            return search_for_previous_sky()
-
-        def search_for_previous_sky():
-            for i in reversed(list(range(0, index_of_science_data))):
-                if self.m_time_stamps[i].m_im_type == 'SKY':
-                    return self.m_sky_in_port[self.m_time_stamps[i].m_index, ]
-
-            # no previous sky found, look for next sky
-            return search_for_next_sky()
-
-        if self.m_mode == 'next':
-            return search_for_next_sky()
-
-        if self.m_mode == 'previous':
-            return search_for_previous_sky()
-
-        if self.m_mode == 'both':
-            previous_sky = search_for_previous_sky()
-            next_sky = search_for_next_sky()
-
-            return (previous_sky+next_sky)/2.
 
     @typechecked
     def run(self) -> None:
@@ -549,16 +464,22 @@ class NoddingBackgroundModule(ProcessingModule):
         self.m_image_out_port.del_all_data()
         self.m_image_out_port.del_all_attributes()
 
-        self._create_time_stamp_list()
+        time_stamps = create_timestamp_list(input_port_1=self.m_science_in_port,
+                                            input_port_2=self.m_sky_in_port,
+                                            type_1="SCIENCE",
+                                            type_2="SKY")
 
         start_time = time.time()
-        for i, time_entry in enumerate(self.m_time_stamps):
-            progress(i, len(self.m_time_stamps), 'Running NoddingBackgroundModule...', start_time)
+        for i, time_entry in enumerate(time_stamps):
+            progress(i, len(time_stamps), 'Running NoddingBackgroundModule...', start_time)
 
             if time_entry.m_im_type == 'SKY':
                 continue
 
-            sky = self.calc_sky_frame(i)
+            sky = calc_sky_frame(time_stamps=time_stamps,
+                                 sky_in_port=self.m_sky_in_port,
+                                 index_of_science_data=i,
+                                 mode=self.m_mode)
             science = self.m_science_in_port[time_entry.m_index, ]
 
             self.m_image_out_port.append(science - sky[None, ], data_dim=3)
