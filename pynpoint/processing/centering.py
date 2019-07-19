@@ -15,6 +15,7 @@ from skimage.feature import register_translation
 from skimage.transform import rescale
 from scipy.ndimage.filters import gaussian_filter
 from scipy.optimize import curve_fit
+from scipy.interpolate import interp1d
 from astropy.modeling import models, fitting
 from typeguard import typechecked
 
@@ -748,7 +749,9 @@ class WaffleCenteringModule(ProcessingModule):
         image_in_tag : str
             Tag of the database entry with science images that are read as input.
         center_in_tag : str
-            Tag of the database entry with the center frame that is read as input.
+            Tag of the database entry with the center frame that is read as input. If the same
+            tag as *image_in_tag* is given, it is assumed that the waffle spots are switched on
+            during the full science sequence.
         image_out_tag : str
             Tag of the database entry with the centered images that are written as output. Should
             be different from *image_in_tag*.
@@ -776,7 +779,15 @@ class WaffleCenteringModule(ProcessingModule):
         super(WaffleCenteringModule, self).__init__(name_in)
 
         self.m_image_in_port = self.add_input_port(image_in_tag)
-        self.m_center_in_port = self.add_input_port(center_in_tag)
+
+        if center_in_tag == image_in_tag:
+            warnings.warn("It is assumed that the waffle spots are switched on"
+                          "during the full science sequence.")
+
+            self.m_center_in_port = self.m_image_in_port
+        else:
+            self.m_center_in_port = self.add_input_port(center_in_tag)
+
         self.m_image_out_port = self.add_output_port(image_out_tag)
 
         self.m_size = size
@@ -786,57 +797,10 @@ class WaffleCenteringModule(ProcessingModule):
         self.m_sigma = sigma
         self.m_dither = dither
 
-    @typechecked
-    def run(self) -> None:
-        """
-        Run method of the module. Locates the position of the calibration spots in the center
-        frame. From the four spots, the position of the star behind the coronagraph is fitted,
-        and the images are shifted and cropped.
+        self.m_time_stamps = []
 
-        Returns
-        -------
-        NoneType
-            None
-        """
-
-        def _get_center(center):
-            center_frame = self.m_center_in_port[0, ]
-
-            if center_shape[0] > 1:
-                warnings.warn('Multiple center images found. Using the first image of the stack.')
-
-            if center is None:
-                center = center_pixel(center_frame)
-            else:
-                center = (np.floor(center[0]), np.floor(center[1]))
-
-            return center_frame, center
-
-        self.m_image_out_port.del_all_data()
-        self.m_image_out_port.del_all_attributes()
-
-        center_shape = self.m_center_in_port.get_shape()
-        im_shape = self.m_image_in_port.get_shape()
-
-        center_frame, self.m_center = _get_center(self.m_center)
-
-        if im_shape[-2:] != center_shape[-2:]:
-            raise ValueError('Science and center images should have the same shape.')
-
-        pixscale = self.m_image_in_port.get_attribute('PIXSCALE')
-
-        self.m_sigma /= pixscale
-
-        if self.m_size is not None:
-            self.m_size = int(math.ceil(self.m_size/pixscale))
-
-        if self.m_dither:
-            dither_x = self.m_image_in_port.get_attribute('DITHER_X')
-            dither_y = self.m_image_in_port.get_attribute('DITHER_Y')
-
-            nframes = self.m_image_in_port.get_attribute('NFRAMES')
-            nframes = np.cumsum(nframes)
-            nframes = np.insert(nframes, 0, 0)
+    def _get_center(self,
+                    center_frame):
 
         center_frame_unsharp = center_frame - gaussian_filter(input=center_frame,
                                                               sigma=self.m_sigma)
@@ -859,38 +823,38 @@ class WaffleCenteringModule(ProcessingModule):
                 x_0 = np.floor(self.m_center[0] + self.m_radius * np.cos(np.pi / 4. * (2 * i)))
                 y_0 = np.floor(self.m_center[1] + self.m_radius * np.sin(np.pi / 4. * (2 * i)))
 
-            tmp_center_frame = crop_image(image=center_frame_unsharp,
-                                          center=(int(y_0), int(x_0)),
-                                          size=ref_image_size)
+            center_frame_unsharp_cut = crop_image(image=center_frame_unsharp,
+                                                  center=(int(y_0), int(x_0)),
+                                                  size=ref_image_size)
 
             # find maximum in tmp image
-            coords = np.unravel_index(indices=np.argmax(tmp_center_frame),
-                                      shape=tmp_center_frame.shape)
+            coords = np.unravel_index(indices=np.argmax(center_frame_unsharp_cut),
+                                      shape=center_frame_unsharp_cut.shape)
 
             y_max, x_max = coords[0], coords[1]
 
-            pixmax = tmp_center_frame[y_max, x_max]
+            pixmax = center_frame_unsharp_cut[y_max, x_max]
             max_pos = np.array([x_max, y_max]).reshape(1, 2)
 
             # Check whether it is the correct maximum: second brightest pixel should be nearby
-            tmp_center_frame[y_max, x_max] = 0.
+            center_frame_unsharp_cut[y_max, x_max] = 0.
 
             # introduce distance parameter
             dist = np.inf
 
             while dist > 2:
-                coords = np.unravel_index(indices=np.argmax(tmp_center_frame),
-                                          shape=tmp_center_frame.shape)
+                coords = np.unravel_index(indices=np.argmax(center_frame_unsharp_cut),
+                                          shape=center_frame_unsharp_cut.shape)
 
                 y_max_new, x_max_new = coords[0], coords[1]
 
-                pixmax_new = tmp_center_frame[y_max_new, x_max_new]
+                pixmax_new = center_frame_unsharp_cut[y_max_new, x_max_new]
 
                 # Caculate minimal distance to previous points
-                tmp_center_frame[y_max_new, x_max_new] = 0.
+                center_frame_unsharp_cut[y_max_new, x_max_new] = 0.
 
-                dist = np.amin(np.linalg.norm(np.vstack((max_pos[:, 0]-x_max_new,
-                                                         max_pos[:, 1]-y_max_new)),
+                dist = np.amin(np.linalg.norm(np.vstack((max_pos[:, 0] - x_max_new,
+                                                         max_pos[:, 1] - y_max_new)),
                                               axis=0))
 
                 if dist <= 2 and pixmax_new < pixmax:
@@ -902,8 +866,8 @@ class WaffleCenteringModule(ProcessingModule):
                 y_max = y_max_new
                 pixmax = pixmax_new
 
-            x_0 = x_0 - (ref_image_size-1)/2 + x_max
-            y_0 = y_0 - (ref_image_size-1)/2 + y_max
+            x_0 = x_0 - (ref_image_size - 1) / 2 + x_max
+            y_0 = y_0 - (ref_image_size - 1) / 2 + y_max
 
             # create reference image around determined maximum
             ref_center_frame = crop_image(image=center_frame_unsharp,
@@ -920,8 +884,8 @@ class WaffleCenteringModule(ProcessingModule):
 
             fit_gauss = fitting.LevMarLSQFitter()
 
-            y_grid, x_grid = np.mgrid[y_0-(ref_image_size-1)/2:y_0+(ref_image_size-1)/2+1,
-                                      x_0-(ref_image_size-1)/2:x_0+(ref_image_size-1)/2+1]
+            y_grid, x_grid = np.mgrid[y_0 - (ref_image_size - 1) / 2:y_0 + (ref_image_size - 1) / 2 + 1,
+                             x_0 - (ref_image_size - 1) / 2:x_0 + (ref_image_size - 1) / 2 + 1]
 
             gauss = fit_gauss(gauss_init,
                               x_grid,
@@ -933,13 +897,125 @@ class WaffleCenteringModule(ProcessingModule):
 
         # Find star position as intersection of two lines
 
-        x_center = ((y_pos[0]-x_pos[0]*(y_pos[2]-y_pos[0])/(x_pos[2]-float(x_pos[0]))) -
-                    (y_pos[1]-x_pos[1]*(y_pos[1]-y_pos[3])/(x_pos[1]-float(x_pos[3])))) / \
-            ((y_pos[1]-y_pos[3])/(x_pos[1]-float(x_pos[3])) -
-                (y_pos[2]-y_pos[0])/(x_pos[2]-float(x_pos[0])))
+        x_center = ((y_pos[0] - x_pos[0] * (y_pos[2] - y_pos[0]) / (x_pos[2] - float(x_pos[0]))) -
+                    (y_pos[1] - x_pos[1] * (y_pos[1] - y_pos[3]) / (x_pos[1] - float(x_pos[3])))) / \
+                   ((y_pos[1] - y_pos[3]) / (x_pos[1] - float(x_pos[3])) -
+                    (y_pos[2] - y_pos[0]) / (x_pos[2] - float(x_pos[0])))
 
-        y_center = x_center*(y_pos[1]-y_pos[3])/(x_pos[1]-float(x_pos[3])) + \
-            (y_pos[1]-x_pos[1]*(y_pos[1]-y_pos[3])/(x_pos[1]-float(x_pos[3])))
+        y_center = x_center * (y_pos[1] - y_pos[3]) / (x_pos[1] - float(x_pos[3])) + \
+                   (y_pos[1] - x_pos[1] * (y_pos[1] - y_pos[3]) / (x_pos[1] - float(x_pos[3])))
+
+        return x_center, y_center
+
+    def _get_shifts(self,
+                    center_coordinates):
+
+        print(center_coordinates)
+        # print(exp_no_science)
+        # print(exp_no_center)
+        # print(nframes_science)
+        # print(nimages)
+
+        exp_no_center = self.m_center_in_port.get_attribute('EXP_NO')
+        exp_no_science = self.m_image_in_port.get_attribute('EXP_NO')
+
+        nframes_science = self.m_image_in_port.get_attribute('NFRAMES')
+
+        nimages = self.m_image_in_port.get_shape()[0]
+
+        # correct exp_no for nframes parameter
+        exp_science_corr = np.zeros(nimages)
+
+        center_interp = interp1d(x=exp_no_center,
+                                 y=center_coordinates,
+                                 axis=0,
+                                 bounds_error=False,
+                                 fill_value=np.nan)
+
+        print(center_interp(exp_no_science))
+
+        for i in range(nimages):
+
+            continue
+
+        return
+
+    @typechecked
+    def run(self) -> None:
+        """
+        Run method of the module. Locates the position of the calibration spots in the center
+        frame. From the four spots, the position of the star behind the coronagraph is fitted,
+        and the images are shifted and cropped.
+
+        Returns
+        -------
+        NoneType
+            None
+        """
+
+        # def _get_center(center):
+        #     # center_frame = self.m_center_in_port[0, ]
+        #     #
+        #     # if center_shape[0] > 1:
+        #     #     warnings.warn('Multiple center images found. Using the first image of the stack.')
+        #
+        #     if center is None:
+        #         center = center_pixel(center_frame)
+        #     else:
+        #         center = (np.floor(center[0]), np.floor(center[1]))
+        #
+        #     return center
+
+        self.m_image_out_port.del_all_data()
+        self.m_image_out_port.del_all_attributes()
+
+        center_shape = self.m_center_in_port.get_shape()
+        im_shape = self.m_image_in_port.get_shape()
+
+        if im_shape[-2:] != center_shape[-2:]:
+            raise ValueError('Science and center images should have the same shape.')
+
+        # self._create_time_stamp_list()
+
+        center_frames = self.m_center_in_port.get_all()
+        if self.m_center is None:
+            self.m_center = center_pixel(center_frames)
+        else:
+            self.m_center = (np.floor(self.m_center[0]), np.floor(self.m_center[1]))
+
+        # exp_no_center = self.m_center_in_port.get_attribute('EXP_NO')
+        # exp_no_science = self.m_image_in_port.get_attribute('EXP_NO')
+
+        nframes_center = self.m_center_in_port.get_attribute('NFRAMES')
+        nframes_center = np.cumsum(nframes_center)
+        nframes_science = self.m_image_in_port.get_attribute('NFRAMES')
+        nframes_science = np.cumsum(nframes_science)
+        nframes_science = np.insert(nframes_science, 0, 0)  # TODO can this be skipped?
+
+        # TODO. remove this warning if image and center are the same
+        if np.all(nframes_center != 1):
+            warnings.warn('The NFRAMES values of the center images are not all equal to unity. '
+                          'The StackCubesModule should be applied on the center images before '
+                          'the WaffleCenteringModule is used.')
+
+        pixscale = self.m_image_in_port.get_attribute('PIXSCALE')
+
+        self.m_sigma /= pixscale
+
+        if self.m_size is not None:
+            self.m_size = int(math.ceil(self.m_size/pixscale))
+
+        if self.m_dither:
+            dither_x = self.m_image_in_port.get_attribute('DITHER_X')
+            dither_y = self.m_image_in_port.get_attribute('DITHER_Y')
+
+        center_coordinates = np.zeros((len(nframes_center), 2))
+
+        for i, tmp_center_frame in enumerate(center_frames[:,...]):
+
+            center_coordinates[i] = self._get_center(tmp_center_frame)
+
+        shift_yx = center_coordinates[0,::-1] # self._get_shifts(center_coordinates=center_coordinates)
 
         nimages = self.m_image_in_port.get_shape()[0]
         npix = self.m_image_in_port.get_shape()[1]
@@ -950,24 +1026,23 @@ class WaffleCenteringModule(ProcessingModule):
 
             image = self.m_image_in_port[i, ]
 
-            shift_yx = np.array([(float(im_shape[-2])-1.)/2. - y_center,
-                                 (float(im_shape[-1])-1.)/2. - x_center])
+            shift_final = (np.asarray(im_shape[-2:]) - 1) / 2 - shift_yx#[i,...]
 
             if self.m_dither:
-                index = np.digitize(i, nframes, right=False) - 1
+                index = np.digitize(i, nframes_science, right=False) - 1
 
-                shift_yx[0] -= dither_y[index]
-                shift_yx[1] -= dither_x[index]
+                shift_final[0] -= dither_y[index]
+                shift_final[1] -= dither_x[index]
 
             if npix % 2 == 0 and self.m_size is not None:
                 im_tmp = np.zeros((image.shape[0]+1, image.shape[1]+1))
                 im_tmp[:-1, :-1] = image
                 image = im_tmp
 
-                shift_yx[0] += 0.5
-                shift_yx[1] += 0.5
-
-            im_shift = shift_image(image, shift_yx, 'spline')
+                shift_final[0] += 0.5
+                shift_final[1] += 0.5
+            print(shift_final)
+            im_shift = shift_image(image, shift_final, 'spline')
 
             if self.m_size is not None:
                 im_crop = crop_image(im_shift, None, self.m_size)
@@ -976,10 +1051,10 @@ class WaffleCenteringModule(ProcessingModule):
                 self.m_image_out_port.append(im_shift, data_dim=3)
 
         sys.stdout.write('Running WaffleCenteringModule... [DONE]\n')
-        sys.stdout.write('Center [x, y] = ['+str(x_center)+', '+str(y_center)+']\n')
+        sys.stdout.write('Center [x, y] = ['+str(center_coordinates[0,0])+', '+str(center_coordinates[0,1])+']\n')
         sys.stdout.flush()
 
-        history = f'[x, y] = [{round(x_center, 2)}, {round(y_center, 2)}]'
+        history = f'[x, y] = [{round(center_coordinates[0,0], 2)}, {round(center_coordinates[0,1], 2)}]'
         self.m_image_out_port.copy_attributes(self.m_image_in_port)
         self.m_image_out_port.add_history('WaffleCenteringModule', history)
         self.m_image_out_port.close_port()
